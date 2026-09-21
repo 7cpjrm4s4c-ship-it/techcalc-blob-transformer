@@ -568,19 +568,22 @@ export default {
       }
 
       if (route.action === "transform") {
-        return handleTransform(request, env, route, body);
+        return await handleTransform(request, env, route, body);
       }
 
       if (route.action === "patch") {
-        return handlePatch(request, env, route, body);
+        return await handlePatch(request, env, route, body);
       }
 
       return errorResponse("Unsupported action.", 404);
     } catch (error) {
+      const status = error && typeof error.status === "number" ? error.status : 500;
+      const details = error && "details" in error ? error.details : undefined;
+
       return errorResponse(
         error instanceof Error ? error.message : "Unexpected worker error.",
-        error.status || 500,
-        error.details
+        status,
+        details
       );
     }
   }
