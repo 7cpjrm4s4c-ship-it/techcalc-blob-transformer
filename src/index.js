@@ -1,10 +1,11 @@
-const GITHUB_API_BASE = "https://api.github.com";
+const GitHubApiBaseUrl = "https://api.github.com";
+const JsonContentType = "application/json; charset=utf-8";
 
 function jsonResponse(payload, status = 200) {
   return new Response(JSON.stringify(payload, null, 2), {
     status,
     headers: {
-      "content-type": "application/json; charset=utf-8",
+      "content-type": JsonContentType,
       "cache-control": "no-store"
     }
   });
@@ -13,6 +14,8 @@ function jsonResponse(payload, status = 200) {
 function errorResponse(message, status = 400, details = undefined) {
   return jsonResponse(
     {
+      ok: false,
+      service: "techcalc-blob-transformer",
       error: message,
       ...(details ? { details } : {})
     },
@@ -20,16 +23,30 @@ function errorResponse(message, status = 400, details = undefined) {
   );
 }
 
+function createHttpError(status, message, details = undefined) {
+  const error = new Error(message);
+  error.status = status;
+  error.details = details;
+  return error;
+}
+
 function requireEnv(env, name) {
   const value = env[name];
+
   if (!value || typeof value !== "string") {
-    throw new Error(`Missing required environment variable: ${name}`);
+    throw createHttpError(500, `Missing required environment variable: ${name}`);
   }
+
   return value;
 }
 
 function validateClientAuthorization(request, env) {
-  const expectedToken = requireEnv(env, "TRANSFORM_API_TOKEN");
+  const expectedToken = env.TRANSFORM_API_TOKEN;
+
+  if (!expectedToken) {
+    return true;
+  }
+
   const authorization = request.headers.get("authorization") || "";
 
   if (!authorization.startsWith("Bearer ")) {
@@ -41,11 +58,16 @@ function validateClientAuthorization(request, env) {
 }
 
 function validateAllowedRepository(owner, repo, env) {
-  const allowedRepository = requireEnv(env, "ALLOWED_REPOSITORY");
+  const allowedRepository = env.ALLOWED_REPOSITORY;
+
+  if (!allowedRepository) {
+    return true;
+  }
+
   return `${owner}/${repo}` === allowedRepository;
 }
 
-function parseBlobTransformPath(pathname) {
+function parsePathRoute(pathname) {
   const match = pathname.match(
     /^\/repos\/([^/]+)\/([^/]+)\/git\/blobs\/([^/]+)\/(transform|patch)$/
   );
@@ -62,9 +84,58 @@ function parseBlobTransformPath(pathname) {
   };
 }
 
+function parseBodyRoute(pathname, body) {
+  const normalizedPath = pathname.endsWith("/") && pathname.length > 1
+    ? pathname.slice(0, -1)
+    : pathname;
+
+  if (normalizedPath === "/transformBlob" || normalizedPath === "/transform-blob") {
+    return createBodyRoute(body, "transform");
+  }
+
+  if (normalizedPath === "/patchBlob" || normalizedPath === "/patch-blob") {
+    return createBodyRoute(body, "patch");
+  }
+
+  if (normalizedPath === "/" && Array.isArray(body?.operations)) {
+    return createBodyRoute(body, "transform");
+  }
+
+  if (normalizedPath === "/" && typeof body?.patch === "string") {
+    return createBodyRoute(body, "patch");
+  }
+
+  return null;
+}
+
+function createBodyRoute(body, action) {
+  return {
+    owner: body.owner,
+    repo: body.repo,
+    fileSha: body.file_sha || body.fileSha,
+    action
+  };
+}
+
+function validateRoute(route) {
+  validateRequiredString(route.owner, "owner");
+  validateRequiredString(route.repo, "repo");
+  validateRequiredString(route.fileSha, "file_sha");
+
+  if (!/^[a-f0-9]{40}$/i.test(route.fileSha)) {
+    throw createHttpError(400, "file_sha must be a 40-character Git SHA.");
+  }
+}
+
+function validateRequiredString(value, fieldName) {
+  if (typeof value !== "string" || value.length === 0) {
+    throw createHttpError(400, `${fieldName} is required.`);
+  }
+}
+
 function decodeBase64Utf8(base64Content) {
   const binary = atob(base64Content.replace(/\s/g, ""));
-  const bytes = Uint8Array.from(binary, (char) => char.charCodeAt(0));
+  const bytes = Uint8Array.from(binary, (character) => character.charCodeAt(0));
   return new TextDecoder("utf-8", { fatal: false }).decode(bytes);
 }
 
@@ -72,8 +143,8 @@ function encodeUtf8Base64(text) {
   const bytes = new TextEncoder().encode(text);
   let binary = "";
 
-  for (let i = 0; i < bytes.length; i += 1) {
-    binary += String.fromCharCode(bytes[i]);
+  for (const byte of bytes) {
+    binary += String.fromCharCode(byte);
   }
 
   return btoa(binary);
@@ -94,7 +165,7 @@ function normalizeOutputEncoding(value) {
 async function githubFetch(path, env, options = {}) {
   const githubToken = requireEnv(env, "GITHUB_TOKEN");
 
-  const response = await fetch(`${GITHUB_API_BASE}${path}`, {
+  const response = await fetch(`${GitHubApiBaseUrl}${path}`, {
     ...options,
     headers: {
       accept: "application/vnd.github+json",
@@ -117,8 +188,10 @@ async function githubFetch(path, env, options = {}) {
   }
 
   if (!response.ok) {
-    throw new Error(
-      `GitHub API request failed: ${response.status} ${response.statusText} ${JSON.stringify(payload)}`
+    throw createHttpError(
+      response.status,
+      `GitHub API request failed: ${response.status} ${response.statusText}`,
+      payload
     );
   }
 
@@ -136,11 +209,11 @@ async function getGitBlob(owner, repo, fileSha, env) {
   );
 
   if (!blob || typeof blob.content !== "string") {
-    throw new Error("GitHub blob response did not contain content.");
+    throw createHttpError(502, "GitHub blob response did not contain content.");
   }
 
   if (blob.encoding !== "base64") {
-    throw new Error(`Unsupported GitHub blob encoding: ${blob.encoding}`);
+    throw createHttpError(415, `Unsupported GitHub blob encoding: ${blob.encoding}`);
   }
 
   return {
@@ -154,14 +227,13 @@ async function getGitBlob(owner, repo, fileSha, env) {
 async function createGitBlob(owner, repo, text, env, outputEncoding) {
   const encodedOwner = encodeURIComponent(owner);
   const encodedRepo = encodeURIComponent(repo);
-
   const encoding = normalizeOutputEncoding(outputEncoding);
   const content = encoding === "base64" ? encodeUtf8Base64(text) : text;
 
   return githubFetch(`/repos/${encodedOwner}/${encodedRepo}/git/blobs`, env, {
     method: "POST",
     headers: {
-      "content-type": "application/json"
+      "content-type": JsonContentType
     },
     body: JSON.stringify({
       content,
@@ -175,26 +247,26 @@ function applyTextOperations(inputText, operations) {
 
   const results = operations.map((operation) => {
     if (!operation || typeof operation !== "object") {
-      throw new Error("Each operation must be an object.");
+      throw createHttpError(400, "Each operation must be an object.");
     }
 
     const { type, search, replace } = operation;
 
     if (type !== "replace" && type !== "replaceRegex") {
-      throw new Error(`Unsupported operation type: ${type}`);
+      throw createHttpError(400, `Unsupported operation type: ${type}`);
     }
 
     if (typeof search !== "string") {
-      throw new Error("Operation search must be a string.");
+      throw createHttpError(400, "Operation search must be a string.");
     }
 
     if (typeof replace !== "string") {
-      throw new Error("Operation replace must be a string.");
+      throw createHttpError(400, "Operation replace must be a string.");
     }
 
     if (type === "replace") {
       if (search.length === 0) {
-        throw new Error("replace search must not be empty.");
+        throw createHttpError(400, "replace search must not be empty.");
       }
 
       const matches = outputText.split(search).length - 1;
@@ -211,7 +283,6 @@ function applyTextOperations(inputText, operations) {
     const flags = typeof operation.flags === "string" ? operation.flags : "g";
     const safeFlags = flags.includes("g") ? flags : `${flags}g`;
     const regex = new RegExp(search, safeFlags);
-
     const matches = Array.from(outputText.matchAll(regex)).length;
     const before = outputText;
     outputText = outputText.replace(regex, replace);
@@ -262,7 +333,7 @@ function parseUnifiedDiff(patch) {
   }
 
   if (hunks.length === 0) {
-    throw new Error("Patch does not contain a unified diff hunk.");
+    throw createHttpError(400, "Patch does not contain a unified diff hunk.");
   }
 
   return hunks;
@@ -283,6 +354,10 @@ function applyUnifiedDiff(inputText, patch) {
   for (const hunk of hunks) {
     const hunkStartIndex = hunk.oldStart - 1;
 
+    if (hunkStartIndex < sourceIndex) {
+      throw createHttpError(409, "Patch hunks overlap or are out of order.");
+    }
+
     while (sourceIndex < hunkStartIndex) {
       outputLines.push(sourceLines[sourceIndex]);
       sourceIndex += 1;
@@ -298,22 +373,30 @@ function applyUnifiedDiff(inputText, patch) {
 
       if (marker === " ") {
         if (sourceLines[sourceIndex] !== content) {
-          throw new Error(
+          throw createHttpError(
+            409,
             `Patch context mismatch at source line ${sourceIndex + 1}.`
           );
         }
 
         outputLines.push(content);
         sourceIndex += 1;
-      } else if (marker === "-") {
+        continue;
+      }
+
+      if (marker === "-") {
         if (sourceLines[sourceIndex] !== content) {
-          throw new Error(
+          throw createHttpError(
+            409,
             `Patch removal mismatch at source line ${sourceIndex + 1}.`
           );
         }
 
         sourceIndex += 1;
-      } else if (marker === "+") {
+        continue;
+      }
+
+      if (marker === "+") {
         outputLines.push(content);
       }
     }
@@ -330,7 +413,8 @@ function applyUnifiedDiff(inputText, patch) {
 
 function validateSafetyChecks(blob, body) {
   if (body.expected_sha && body.expected_sha !== blob.sha) {
-    throw new Error(
+    throw createHttpError(
+      409,
       `expected_sha mismatch: expected ${body.expected_sha}, got ${blob.sha}`
     );
   }
@@ -340,15 +424,26 @@ function validateSafetyChecks(blob, body) {
     Number.isFinite(body.expected_size) &&
     body.expected_size !== blob.size
   ) {
-    throw new Error(
+    throw createHttpError(
+      409,
       `expected_size mismatch: expected ${body.expected_size}, got ${blob.size}`
     );
   }
 }
 
-async function handleTransform(request, env, route) {
-  const body = await request.json();
+function createBaseOperationResponse(blob, outputText, dryRun, operation) {
+  return {
+    ok: true,
+    service: "techcalc-blob-transformer",
+    operation,
+    dry_run: dryRun,
+    input_sha: blob.sha,
+    input_size: blob.size,
+    output_size: byteSizeUtf8(outputText)
+  };
+}
 
+async function handleTransform(request, env, route, body) {
   if (!Array.isArray(body.operations) || body.operations.length === 0) {
     return errorResponse("Request body requires non-empty operations array.", 400);
   }
@@ -357,19 +452,20 @@ async function handleTransform(request, env, route) {
   validateSafetyChecks(blob, body);
 
   const transformed = applyTextOperations(blob.text, body.operations);
-  const outputSize = byteSizeUtf8(transformed.outputText);
   const dryRun = body.dry_run === true;
+  const matches = transformed.operations.reduce((sum, operation) => {
+    return sum + operation.matches;
+  }, 0);
+  const response = {
+    ...createBaseOperationResponse(blob, transformed.outputText, dryRun, "transformBlob"),
+    changed: blob.text !== transformed.outputText,
+    matches,
+    operation_count: transformed.operations.length,
+    operations: transformed.operations
+  };
 
   if (dryRun) {
-    return jsonResponse(
-      {
-        input_sha: blob.sha,
-        input_size: blob.size,
-        output_size: outputSize,
-        operations: transformed.operations
-      },
-      200
-    );
+    return jsonResponse(response);
   }
 
   const createdBlob = await createGitBlob(
@@ -382,19 +478,15 @@ async function handleTransform(request, env, route) {
 
   return jsonResponse(
     {
-      input_sha: blob.sha,
-      input_size: blob.size,
+      ...response,
       output_sha: createdBlob.sha,
-      output_size: outputSize,
-      operations: transformed.operations
+      output_encoding: normalizeOutputEncoding(body.output_encoding)
     },
     201
   );
 }
 
-async function handlePatch(request, env, route) {
-  const body = await request.json();
-
+async function handlePatch(request, env, route, body) {
   if (typeof body.patch !== "string" || body.patch.length === 0) {
     return errorResponse("Request body requires patch string.", 400);
   }
@@ -403,20 +495,14 @@ async function handlePatch(request, env, route) {
   validateSafetyChecks(blob, body);
 
   const outputText = applyUnifiedDiff(blob.text, body.patch);
-  const outputSize = byteSizeUtf8(outputText);
-  const changed = outputText !== blob.text;
   const dryRun = body.dry_run === true;
+  const response = {
+    ...createBaseOperationResponse(blob, outputText, dryRun, "patchBlob"),
+    changed: blob.text !== outputText
+  };
 
   if (dryRun) {
-    return jsonResponse(
-      {
-        input_sha: blob.sha,
-        input_size: blob.size,
-        output_size: outputSize,
-        changed
-      },
-      200
-    );
+    return jsonResponse(response);
   }
 
   const createdBlob = await createGitBlob(
@@ -429,14 +515,20 @@ async function handlePatch(request, env, route) {
 
   return jsonResponse(
     {
-      input_sha: blob.sha,
-      input_size: blob.size,
+      ...response,
       output_sha: createdBlob.sha,
-      output_size: outputSize,
-      changed
+      output_encoding: normalizeOutputEncoding(body.output_encoding)
     },
     201
   );
+}
+
+async function readJsonBody(request) {
+  try {
+    return await request.json();
+  } catch {
+    throw createHttpError(400, "Request body must be valid JSON.");
+  }
 }
 
 export default {
@@ -444,22 +536,26 @@ export default {
     try {
       const url = new URL(request.url);
 
-      if (request.method === "GET" && url.pathname === "/health") {
+      if (request.method === "GET" && (url.pathname === "/" || url.pathname === "/health")) {
         return jsonResponse({
           ok: true,
           service: "techcalc-blob-transformer"
         });
       }
 
-      const route = parseBlobTransformPath(url.pathname);
+      if (request.method !== "POST") {
+        return errorResponse("Method not allowed.", 405);
+      }
+
+      const body = await readJsonBody(request);
+      const pathRoute = parsePathRoute(url.pathname);
+      const route = pathRoute || parseBodyRoute(url.pathname, body);
 
       if (!route) {
         return errorResponse("Not found.", 404);
       }
 
-      if (request.method !== "POST") {
-        return errorResponse("Method not allowed.", 405);
-      }
+      validateRoute(route);
 
       if (!validateClientAuthorization(request, env)) {
         return errorResponse("Unauthorized.", 401);
@@ -472,18 +568,19 @@ export default {
       }
 
       if (route.action === "transform") {
-        return handleTransform(request, env, route);
+        return handleTransform(request, env, route, body);
       }
 
       if (route.action === "patch") {
-        return handlePatch(request, env, route);
+        return handlePatch(request, env, route, body);
       }
 
       return errorResponse("Unsupported action.", 404);
     } catch (error) {
       return errorResponse(
         error instanceof Error ? error.message : "Unexpected worker error.",
-        500
+        error.status || 500,
+        error.details
       );
     }
   }
